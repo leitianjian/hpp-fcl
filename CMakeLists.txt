@@ -152,7 +152,7 @@ if(HPP_FCL_HAS_QHULL)
   endif()
 endif()
 
-FIND_PACKAGE(assimp CONFIG REQUIRED)
+FIND_PACKAGE(assimp REQUIRED)
 
 SET(${PROJECT_NAME}_HEADERS
   include/hpp/fcl/collision_data.h

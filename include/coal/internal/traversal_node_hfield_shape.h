@@ -320,12 +320,13 @@ inline Scalar distanceContactPointToFace(const size_t face_id,
 
 template <typename Polygone, typename Shape>
 bool binCorrection(const ConvexTpl<Polygone>& convex,
-                   const int convex_active_faces, const Shape& shape,
+                   const int convex_active_faces, const Transform3s& tf1, const Shape& shape,
                    const Transform3s& shape_pose, Scalar& distance,
                    Vec3s& contact_1, Vec3s& contact_2, Vec3s& normal,
                    Vec3s& face_normal, const bool is_collision) {
   const Scalar prec = Scalar(1e-12);
   const std::vector<Vec3s>& points = *(convex.points);
+  Vec3s contact_1_local = tf1.inverseTransform(contact_1);
 
   bool hfield_witness_is_on_bin_side = true;
 
@@ -347,7 +348,7 @@ bool binCorrection(const ConvexTpl<Polygone>& convex,
   for (const size_t active_face : active_faces) {
     size_t closest_face_id;
     const Scalar distance_to_face = distanceContactPointToFace(
-        active_face, contact_1, convex, closest_face_id);
+        active_face, contact_1_local, convex, closest_face_id);
 
     const bool contact_point_is_on_face = distance_to_face <= prec;
     if (contact_point_is_on_face) {
@@ -367,31 +368,31 @@ bool binCorrection(const ConvexTpl<Polygone>& convex,
       COAL_THROW_PRETTY("face_triangle is not initialized", std::logic_error);
 
     const Vec3s face_pointA = points[face_triangle[0]];
-    face_normal = computeTriangleNormal(face_triangle, points);
-
+    // face_normal = computeTriangleNormal(face_triangle, points);
+    Vec3s face_normal_local = computeTriangleNormal(face_triangle, points);
+    Transform3s shape_pose_local = tf1.inverseTimes(shape_pose);
     int hint = 0;
     // Since we compute the support manually, we need to take into account the
     // sphere swept radius of the shape.
     // TODO: take into account the swept-sphere radius of the bin.
     const Vec3s _support = getSupport<details::SupportOptions::WithSweptSphere>(
-        &shape, -shape_pose.rotation().transpose() * face_normal, hint);
-    const Vec3s support =
-        shape_pose.rotation() * _support + shape_pose.translation();
+        &shape, -shape_pose_local.rotation().transpose() * face_normal_local, hint);
+    const Vec3s support_local =
+        shape_pose_local.rotation() * _support + shape_pose_local.translation();
 
     // Project support into the inclined bin having triangle
-    const Scalar offset_plane = face_normal.dot(face_pointA);
-    const Plane projection_plane(face_normal, offset_plane);
-    const Scalar distance_support_projection_plane =
-        projection_plane.signedDistance(support);
+    const Scalar offset_plane = face_normal_local.dot(face_pointA);
+    const Plane projection_plane(face_normal_local, offset_plane);
+    const Scalar distance_support_projection_plane = projection_plane.signedDistance(support_local);
 
-    const Vec3s projected_support =
-        support - distance_support_projection_plane * face_normal;
+    Vec3s projected_support_local = support_local - distance_support_projection_plane * face_normal_local;
+    Vec3s contact_1_out_local = projectPointOnTriangle(projected_support_local, face_triangle, points);
+    Vec3s contact_2_out_local = contact_1_out_local + distance_support_projection_plane * face_normal_local;
 
-    // We need now to project the projected in the triangle shape
-    contact_1 =
-        projectPointOnTriangle(projected_support, face_triangle, points);
-    contact_2 = contact_1 + distance_support_projection_plane * face_normal;
-    normal = face_normal;
+    contact_1 = tf1.transform(contact_1_out_local);
+    contact_2 = tf1.transform(contact_2_out_local);
+    normal = tf1.getRotation() * face_normal_local;
+    face_normal = normal;
     distance = -std::fabs(distance_support_projection_plane);
   }
 
@@ -433,7 +434,7 @@ bool shapeDistance(const GJKSolver* nsolver, const CollisionRequest& request,
                      request.collision_distance_threshold);
 
   bool hfield_witness_is_on_bin_side1 =
-      binCorrection(convex1, convex1_active_faces, shape, tf2, distance1,
+      binCorrection(convex1, convex1_active_faces, tf1, shape, tf2, distance1,
                     contact1_1, contact1_2, normal1, normal1_top, collision1);
 
   if (RTIsIdentity) {
@@ -449,7 +450,7 @@ bool shapeDistance(const GJKSolver* nsolver, const CollisionRequest& request,
                      request.collision_distance_threshold);
 
   bool hfield_witness_is_on_bin_side2 =
-      binCorrection(convex2, convex2_active_faces, shape, tf2, distance2,
+      binCorrection(convex2, convex2_active_faces, tf1, shape, tf2, distance2,
                     contact2_1, contact2_2, normal2, normal2_top, collision2);
 
   if (collision1 && collision2) {

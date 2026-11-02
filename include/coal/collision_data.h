@@ -456,6 +456,10 @@ struct COAL_DLLAPI CollisionRequest : QueryRequest {
   /// @brief The maximum number of contacts that can be returned
   size_t num_max_contacts;
 
+  /// @brief Compute support contacts for HeightField/shape leaves.
+  /// Disabled by default to preserve the traditional one-contact-per-leaf API.
+  bool enable_height_field_contact_patches;
+
   /// @brief whether the contact information (normal, penetration depth and
   /// contact position) will return.
   bool enable_contact;
@@ -492,6 +496,7 @@ struct COAL_DLLAPI CollisionRequest : QueryRequest {
   COAL_COMPILER_DIAGNOSTIC_IGNORED_DEPRECECATED_DECLARATIONS
   CollisionRequest(const CollisionRequestFlag flag, size_t num_max_contacts_)
       : num_max_contacts(num_max_contacts_),
+        enable_height_field_contact_patches(false),
         enable_contact(flag & CONTACT),
         enable_distance_lower_bound(flag & DISTANCE_LOWER_BOUND),
         security_margin(0),
@@ -501,6 +506,7 @@ struct COAL_DLLAPI CollisionRequest : QueryRequest {
   /// @brief Default constructor.
   CollisionRequest()
       : num_max_contacts(1),
+        enable_height_field_contact_patches(false),
         enable_contact(true),
         enable_distance_lower_bound(false),
         security_margin(0),
@@ -518,6 +524,8 @@ struct COAL_DLLAPI CollisionRequest : QueryRequest {
     COAL_COMPILER_DIAGNOSTIC_IGNORED_DEPRECECATED_DECLARATIONS
     COAL_EQUAL_OPERATOR_CHECK((QueryRequest::operator==(other)));
     COAL_EQUAL_OPERATOR_CHECK(num_max_contacts == other.num_max_contacts);
+    COAL_EQUAL_OPERATOR_CHECK(enable_height_field_contact_patches ==
+                              other.enable_height_field_contact_patches);
     COAL_EQUAL_OPERATOR_CHECK(enable_contact == other.enable_contact);
     COAL_EQUAL_OPERATOR_CHECK(enable_distance_lower_bound ==
                               other.enable_distance_lower_bound);
@@ -540,6 +548,8 @@ struct COAL_DLLAPI CollisionRequest : QueryRequest {
     using namespace std;
     QueryRequest::disp(os, prefix);
     os << prefix << "  num_max_contacts: " << num_max_contacts << ",\n";
+    os << prefix << "  enable_height_field_contact_patches: "
+       << enable_height_field_contact_patches << ",\n";
     os << prefix << "  enable_contact: " << enable_contact << ",\n";
     os << prefix << "  security_margin: " << security_margin << ",\n";
     os << prefix << "  break_distance: " << break_distance << ",\n";
@@ -641,6 +651,23 @@ struct COAL_DLLAPI CollisionResult : QueryResult {
 
   /// @brief add one contact into result structure
   inline void addContact(const Contact& c) { contacts.push_back(c); }
+
+  /// @brief Add a contact unless an equivalent witness already exists.
+  /// This is used by HeightField patch queries where neighbouring triangles
+  /// can produce the same point on a shared edge.
+  inline bool addContactIfDistinct(const Contact& c,
+                                  Scalar position_tolerance = Scalar(1e-8),
+                                  Scalar normal_cosine = Scalar(0.9999)) {
+    const Scalar tolerance_squared =
+        position_tolerance * position_tolerance;
+    for (const Contact& existing : contacts) {
+      if ((existing.pos - c.pos).squaredNorm() <= tolerance_squared &&
+          existing.normal.dot(c.normal) >= normal_cosine)
+        return false;
+    }
+    contacts.push_back(c);
+    return true;
+  }
 
   /// @brief whether two CollisionResult are the same or not
   inline bool operator==(const CollisionResult& other) const {

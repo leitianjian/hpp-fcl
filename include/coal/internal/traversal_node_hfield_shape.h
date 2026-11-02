@@ -37,9 +37,13 @@
 #ifndef COAL_TRAVERSAL_NODE_HFIELD_SHAPE_H
 #define COAL_TRAVERSAL_NODE_HFIELD_SHAPE_H
 
+#include <cmath>
+#include <limits>
+
 /// @cond INTERNAL
 
 #include "coal/collision_data.h"
+#include "coal/contact_patch.h"
 #include "coal/shape/geometric_shapes.h"
 #include "coal/narrowphase/narrowphase.h"
 #include "coal/shape/geometric_shapes_utility.h"
@@ -623,9 +627,292 @@ class HeightFieldShapeCollisionTraversalNode
       if (this->result->numContacts() < this->request.num_max_contacts) {
         if (normal_face.isApprox(normal) &&
             (collision || !hfield_witness_is_on_bin_side)) {
-          this->result->addContact(Contact(this->model1, this->model2, (int)b1,
-                                           (int)Contact::NONE, c1, c2, normal,
-                                           distance));
+          const Contact leaf_contact(this->model1, this->model2, (int)b1,
+                                     (int)Contact::NONE, c1, c2, normal,
+                                     distance);
+          const NODE_TYPE shape_type = this->model2->getNodeType();
+          const auto cylinder_witness_is_valid = [&](const Vec3s& witness) {
+            const Cylinder* cylinder =
+                dynamic_cast<const Cylinder*>(this->model2);
+            assert(cylinder != nullptr);
+            const Vec3s local = this->tf2.inverseTransform(witness);
+            const Scalar radial = local.head<2>().norm();
+            const Scalar axial = std::abs(local.z());
+            const Scalar tolerance = Scalar(1e-5);
+            return radial <= cylinder->radius + tolerance &&
+                   axial <= cylinder->halfLength + tolerance &&
+                   (std::abs(radial - cylinder->radius) <= tolerance ||
+                    std::abs(axial - cylinder->halfLength) <= tolerance);
+          };
+          const auto cylinder_surface_witness =
+              [&](const Vec3s& terrain_witness, const Vec3s& contact_normal,
+                  Vec3s& shape_witness, Scalar& contact_depth) {
+                const Cylinder* cylinder =
+                    dynamic_cast<const Cylinder*>(this->model2);
+                assert(cylinder != nullptr);
+                const Vec3s origin =
+                    this->tf2.inverseTransform(terrain_witness);
+                const Vec3s direction =
+                    this->tf2.rotation().transpose() * contact_normal;
+                const Scalar radius2 = cylinder->radius * cylinder->radius;
+                Scalar best_t = -std::numeric_limits<Scalar>::infinity();
+                const auto accept = [&](Scalar t) {
+                  if (t <= Scalar(1e-6) && t > best_t) best_t = t;
+                };
+                if (std::abs(direction.z()) > Scalar(1e-8)) {
+                  for (Scalar cap_z : {-cylinder->halfLength,
+                                       cylinder->halfLength}) {
+                    const Scalar t = (cap_z - origin.z()) / direction.z();
+                    const Vec3s point = origin + t * direction;
+                    if (point.head<2>().squaredNorm() <=
+                        radius2 + Scalar(1e-8))
+                      accept(t);
+                  }
+                }
+                const Scalar a = direction.head<2>().squaredNorm();
+                if (a > Scalar(1e-12)) {
+                  const Scalar b = Scalar(2) *
+                      origin.head<2>().dot(direction.head<2>());
+                  const Scalar c = origin.head<2>().squaredNorm() - radius2;
+                  const Scalar discriminant = b * b - Scalar(4) * a * c;
+                  if (discriminant >= Scalar(0)) {
+                    const Scalar root = std::sqrt(discriminant);
+                    for (Scalar t : {(-b - root) / (Scalar(2) * a),
+                                     (-b + root) / (Scalar(2) * a)}) {
+                      const Scalar z = origin.z() + t * direction.z();
+                      if (std::abs(z) <=
+                          cylinder->halfLength + Scalar(1e-8))
+                        accept(t);
+                    }
+                  }
+                }
+                if (!std::isfinite(best_t)) return false;
+                shape_witness =
+                    this->tf2.transform(origin + best_t * direction);
+                contact_depth = best_t;
+                return true;
+              };
+          bool generated_patch_contact = false;
+          if (this->request.enable_height_field_contact_patches) {
+            const auto& cell = this->model1->getBV(b1);
+            const VecXs& x_grid = this->model1->getXGrid();
+            const VecXs& y_grid = this->model1->getYGrid();
+            const MatrixXs& heights = this->model1->getHeights();
+            const Scalar x0 = x_grid[cell.x_id];
+            const Scalar x1 = x_grid[cell.x_id + 1];
+            const Scalar y0 = y_grid[cell.y_id];
+            const Scalar y1 = y_grid[cell.y_id + 1];
+            const auto surface_height = [&](const Scalar u, const Scalar v) {
+              const Scalar h00 = heights(cell.y_id, cell.x_id);
+              const Scalar h01 = heights(cell.y_id + 1, cell.x_id);
+              const Scalar h10 = heights(cell.y_id, cell.x_id + 1);
+              const Scalar h11 = heights(cell.y_id + 1, cell.x_id + 1);
+              return u + v <= Scalar(1)
+                         ? h00 + u * (h10 - h00) + v * (h01 - h00)
+                         : h11 + (Scalar(1) - u) * (h01 - h11) +
+                               (Scalar(1) - v) * (h10 - h11);
+            };
+            if (shape_type == GEOM_SPHERE || shape_type == GEOM_CAPSULE) {
+              // Curved shape patches must use points on the actual surface.
+              // Leaf witnesses from neighbouring cells are not substitutes
+              // for the support points of this face.
+              generated_patch_contact = true;
+              const auto curved_supports = [&](const Vec3s& world_normal) {
+                const Vec3s shape_normal =
+                    this->tf2.rotation().transpose() * world_normal;
+                std::vector<Vec3s> supports;
+                if (shape_type == GEOM_SPHERE) {
+                  const Sphere* sphere =
+                      dynamic_cast<const Sphere*>(this->model2);
+                  assert(sphere != nullptr);
+                  supports.push_back(-sphere->radius * shape_normal);
+                } else {
+                  const Capsule* capsule =
+                      dynamic_cast<const Capsule*>(this->model2);
+                  assert(capsule != nullptr);
+                  Vec3s support = -capsule->radius * shape_normal;
+                  if (std::abs(shape_normal.z()) < Scalar(1e-3)) {
+                    support.z() = -capsule->halfLength;
+                    supports.push_back(support);
+                    support.z() = capsule->halfLength;
+                    supports.push_back(support);
+                  } else {
+                    support.z() += shape_normal.z() > 0
+                                       ? -capsule->halfLength
+                                       : capsule->halfLength;
+                    supports.push_back(support);
+                  }
+                }
+                return supports;
+              };
+              for (const Vec3s& shape_local : curved_supports(normal)) {
+                const Vec3s shape_witness = this->tf2.transform(shape_local);
+                const Vec3s shape_terrain_local =
+                    this->tf1.inverseTransform(shape_witness);
+                const Scalar u0 = (shape_terrain_local.x() - x0) / (x1 - x0);
+                const Scalar v0 = (y0 - shape_terrain_local.y()) / (y0 - y1);
+                const Vec3s normal_terrain =
+                    this->tf1.rotation().transpose() * normal;
+                if (std::abs(normal_terrain.z()) < Scalar(1e-4)) continue;
+                const Scalar h00 = heights(cell.y_id, cell.x_id);
+                const Scalar h01 = heights(cell.y_id + 1, cell.x_id);
+                const Scalar h10 = heights(cell.y_id, cell.x_id + 1);
+                const Scalar h11 = heights(cell.y_id + 1, cell.x_id + 1);
+                Scalar u_face = u0, v_face = v0;
+                Vec3s terrain_local_surface;
+                for (int iteration = 0; iteration < 2; ++iteration) {
+                  const bool lower_triangle = u_face + v_face <= Scalar(1);
+                  const Scalar dh_dx =
+                      (lower_triangle ? h10 - h00 : h11 - h01) / (x1 - x0);
+                  const Scalar dh_dy =
+                      (lower_triangle ? h01 - h00 : h11 - h10) / (y1 - y0);
+                  const Scalar denominator = normal_terrain.z() -
+                      dh_dx * normal_terrain.x() -
+                      dh_dy * normal_terrain.y();
+                  if (std::abs(denominator) < Scalar(1e-6)) break;
+                  const Scalar separation =
+                      (shape_terrain_local.z() -
+                       (lower_triangle
+                            ? h00 + u0 * (h10 - h00) + v0 * (h01 - h00)
+                            : h11 + (Scalar(1) - u0) * (h01 - h11) +
+                                  (Scalar(1) - v0) * (h10 - h11))) /
+                      denominator;
+                  terrain_local_surface =
+                      shape_terrain_local - separation * normal_terrain;
+                  u_face = (terrain_local_surface.x() - x0) / (x1 - x0);
+                  v_face = (y0 - terrain_local_surface.y()) / (y0 - y1);
+                  if ((u_face + v_face <= Scalar(1)) == lower_triangle) break;
+                }
+                const Scalar u = (terrain_local_surface.x() - x0) / (x1 - x0);
+                const Scalar v = (y0 - terrain_local_surface.y()) / (y0 - y1);
+                if (u < Scalar(-1e-6) || u > Scalar(1) + Scalar(1e-6) ||
+                    v < Scalar(-1e-6) || v > Scalar(1) + Scalar(1e-6) ||
+                    std::abs(terrain_local_surface.z() - surface_height(u, v)) >
+                        Scalar(1e-5))
+                  continue;
+                const Vec3s terrain_witness =
+                    this->tf1.transform(terrain_local_surface);
+                const Scalar depth =
+                    (shape_witness - terrain_witness).dot(normal);
+                const Contact curved_contact(
+                    this->model1, this->model2, (int)b1,
+                    (int)Contact::NONE, terrain_witness, shape_witness, normal,
+                    depth);
+                this->result->addContactIfDistinct(curved_contact);
+              }
+              const Vec3s center_terrain =
+                  this->tf1.inverseTransform(this->tf2.translation());
+              const auto append_wall = [&](int axis, Scalar wall,
+                                           const Vec3s& wall_normal_local) {
+                const Vec3s wall_normal =
+                    this->tf1.rotation() * wall_normal_local;
+                for (const Vec3s& shape_local : curved_supports(wall_normal)) {
+                  const Vec3s shape_witness =
+                      this->tf2.transform(shape_local);
+                  const Vec3s shape_terrain =
+                      this->tf1.inverseTransform(shape_witness);
+                  Vec3s wall_point = shape_terrain;
+                  wall_point[axis] = wall;
+                  const Scalar u = (wall_point.x() - x0) / (x1 - x0);
+                  const Scalar v = (y0 - wall_point.y()) / (y0 - y1);
+                  if (u < Scalar(-1e-6) || u > Scalar(1) + Scalar(1e-6) ||
+                      v < Scalar(-1e-6) || v > Scalar(1) + Scalar(1e-6) ||
+                      wall_point.z() < this->model1->getMinHeight() ||
+                      wall_point.z() > surface_height(u, v))
+                    continue;
+                  const Vec3s terrain_witness = this->tf1.transform(wall_point);
+                  const Scalar depth =
+                      (shape_witness - terrain_witness).dot(wall_normal);
+                  if (depth >= Scalar(-1e-8)) continue;
+                  const Contact wall_contact(
+                      this->model1, this->model2, (int)b1,
+                      (int)Contact::NONE, terrain_witness, shape_witness,
+                      wall_normal, depth);
+                  this->result->addContactIfDistinct(wall_contact);
+                }
+              };
+              if (cell.x_id == 0 && center_terrain.x() < x_grid[0])
+                append_wall(0, x_grid[0], Vec3s(-1, 0, 0));
+              if (cell.x_id + 2 == x_grid.size() &&
+                  center_terrain.x() > x_grid[x_grid.size() - 1])
+                append_wall(0, x_grid[x_grid.size() - 1], Vec3s(1, 0, 0));
+              if (cell.y_id == 0 && center_terrain.y() > y_grid[0])
+                append_wall(1, y_grid[0], Vec3s(0, 1, 0));
+              if (cell.y_id + 2 == y_grid.size() &&
+                  center_terrain.y() < y_grid[y_grid.size() - 1])
+                append_wall(1, y_grid[y_grid.size() - 1], Vec3s(0, -1, 0));
+            } else {
+              CollisionResult witness_result;
+              witness_result.addContact(leaf_contact);
+              const ContactPatchRequest patch_request(1, 16, Scalar(1e-3));
+              const auto append_patch = [&](const CollisionGeometry* prism) {
+              ContactPatchResult patch_result(patch_request);
+              computeContactPatch(prism, this->tf1, this->model2, this->tf2,
+                                  witness_result, patch_request,
+                                  patch_result);
+              for (size_t patch_index = 0;
+                   patch_index < patch_result.numContactPatches();
+                   ++patch_index) {
+                const ContactPatch& patch =
+                    patch_result.getContactPatch(patch_index);
+                const Vec3s patch_normal = patch.getNormal();
+                const Scalar patch_depth = patch.penetration_depth;
+                for (size_t point_index = 0; point_index < patch.size();
+                     ++point_index) {
+                  const Vec3s midpoint = patch.getPoint(point_index);
+                  const Vec3s terrain_witness =
+                      midpoint - Scalar(0.5) * patch_depth * patch_normal;
+                  const Vec3s terrain_local =
+                      this->tf1.inverseTransform(terrain_witness);
+                  const Scalar u = (terrain_local.x() - x0) / (x1 - x0);
+                  const Scalar v = (y0 - terrain_local.y()) / (y0 - y1);
+                  if (u < Scalar(-1e-6) || u > Scalar(1) + Scalar(1e-6) ||
+                      v < Scalar(-1e-6) || v > Scalar(1) + Scalar(1e-6))
+                    continue;
+                  if (std::abs(terrain_local.z() - surface_height(u, v)) >
+                      Scalar(1e-5))
+                    continue;
+                  Vec3s shape_witness =
+                      midpoint + Scalar(0.5) * patch_depth * patch_normal;
+                  Scalar contact_depth = patch_depth;
+                  if (shape_type == GEOM_CYLINDER &&
+                      !cylinder_witness_is_valid(shape_witness)) {
+                    if (!cylinder_surface_witness(
+                            terrain_witness, patch_normal, shape_witness,
+                            contact_depth))
+                      continue;
+                  }
+                  const Contact patch_contact(
+                      this->model1, this->model2, (int)b1,
+                      (int)Contact::NONE, terrain_witness, shape_witness,
+                      patch_normal, contact_depth);
+                  this->result->addContactIfDistinct(patch_contact);
+                  generated_patch_contact = true;
+                }
+              }
+              };
+              append_patch(&convex1);
+              append_patch(&convex2);
+            }
+          }
+          if (!generated_patch_contact) {
+            if (this->request.enable_height_field_contact_patches &&
+                shape_type == GEOM_CYLINDER &&
+                !cylinder_witness_is_valid(c2)) {
+              Vec3s shape_witness;
+              Scalar contact_depth;
+              if (cylinder_surface_witness(c1, normal, shape_witness,
+                                           contact_depth)) {
+                const Contact cylinder_contact(
+                    this->model1, this->model2, (int)b1,
+                    (int)Contact::NONE, c1, shape_witness, normal,
+                    contact_depth);
+                this->result->addContactIfDistinct(cylinder_contact);
+              }
+            } else {
+              this->result->addContact(leaf_contact);
+            }
+          }
           assert(this->result->isCollision());
         }
       }
